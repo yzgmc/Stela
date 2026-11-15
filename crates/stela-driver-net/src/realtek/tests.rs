@@ -260,3 +260,5 @@ mod nbase_d_cp;
 mod packet_io;
 mod registers;
 mod stuck_registers;
+
+mod receive_recovery;

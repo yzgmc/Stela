@@ -118,6 +118,8 @@ const DMA_LIMIT: u64 = (1 << 47) - 1;
 const START_SECONDS: u64 = 60;
 /// The longest idle wait while they do, which the timeout above is checked at.
 const WAIT_MICROS: u64 = 10_000;
+/// How often a long wait in the start says where it is ([`wait_for_child`]).
+const WAIT_REPORT_SECONDS: u64 = 2;
 /// The longest one pump runs Linux between the boot PE's slices. What is
 /// still runnable stays pending for the next, so a busy driver shares the
 /// boot CPU with the guest and the host's devices instead of holding it.
@@ -937,6 +939,13 @@ pub(super) struct Claimed {
     link: Option<PcieLink>,
 }
 
+/// Called only between GPU operations, with no storage driver borrowed.
+fn claim_stage(address: stela_drivers::bus::pci::Address, stage: &str) {
+    output::arguments(format_args!("GPU HANDOFF v17 {address}: {stage}\n"));
+    crate::status::progress(&format!("GPU {address}: {stage}"));
+    super::storage::store_usb_log_in_gpu_start();
+}
+
 fn claim(
     services: &dyn NativeServices,
     adapter: &gpu::Adapter,
@@ -945,6 +954,7 @@ fn claim(
     catalog: Arc<Catalog>,
 ) -> Result<Claimed, ServiceError> {
     let address = adapter.address;
+    claim_stage(address, "checking timer and original requester");
     let timer = services.minimum_delay()?;
     let mut requester = services.prepare_requester(address)?;
     let function = requester.function_mut();
@@ -952,6 +962,7 @@ fn claim(
     {
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
+    claim_stage(address, "checking function-level reset capability");
     gpu::cold::check_candidate(function, timer.as_ref())
         .map_err(|error| cold_refusal(address, error))?;
     if let Some(source) = gop.filter(|source| source.address == address) {
@@ -974,6 +985,7 @@ fn claim(
         });
         // BAR sizing below temporarily turns off memory decode.
         checked?;
+        claim_stage(address, "retiring firmware framebuffer before BAR probe");
         if !crate::console::retire_firmware() {
             return Err(ServiceError::Refused(
                 "a firmware framebuffer writer is still active",
@@ -988,6 +1000,7 @@ fn claim(
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
+    claim_stage(address, "probing and restoring PCI BARs");
     let function_bars = function.bars().map_err(ServiceError::Config)?;
     if !matches!(function_bars[0], Some(Bar::Memory { prefetchable: false, size, .. }) if size >= PAGE)
         || function.config().read16(4).map_err(ServiceError::Config)? & 2 == 0
@@ -1029,6 +1042,7 @@ fn claim(
                 | if wide { RESOURCE_WIDE } else { 0 },
         };
     }
+    claim_stage(address, "mapping register BAR and checking chipset");
     let config = function
         .config()
         .retain_epoch()
@@ -1059,6 +1073,7 @@ fn claim(
         alloc::format!("GPU{line}PCIID"),
         alloc::format!("10de:{:04x}", adapter.device),
     );
+    claim_stage(address, "resetting GPU and binding original DMA owner");
     let ready = gpu::cold::Cold::new(gpu::cold::Inputs {
         requester,
         views: GpuViews {
@@ -1071,6 +1086,7 @@ fn claim(
     })
     .quiesce_and_bind()
     .map_err(|failure| cold_refusal(address, failure.error))?;
+    claim_stage(address, "reset and DMA binding completed");
     // SAFETY: both original owners transfer into this retained function
     // lifetime before Linux probe. Only the temporary UC observation is retired.
     let (bound, views) = unsafe { ready.into_parts() };
@@ -1083,7 +1099,9 @@ fn claim(
     if let Some(chip) =
         gpu::nouveau_chip::Chip::from_boot0(boot0).filter(|chip| chip.waits_for_firmware_boot())
     {
+        claim_stage(address, "waiting for GPU firmware boot");
         wait_for_firmware_boot(services, &resources[0], chip)?;
+        claim_stage(address, "GPU firmware boot completed");
     }
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
@@ -1273,6 +1291,7 @@ pub(super) struct Refused {
     pub(super) address: String,
     pub(super) device: u16,
     pub(super) reason: stela_boot_core::gpu_status::Reason,
+    pub(super) detail: Option<String>,
 }
 
 /// Claim every NVIDIA adapter, each reported if it cannot be, and the ones
@@ -1288,6 +1307,7 @@ pub(super) fn claim_all(
         address: format!("{}", adapter.address),
         device: adapter.device,
         reason,
+        detail: None,
     };
     for adapter in adapters
         .iter()
@@ -1315,6 +1335,12 @@ pub(super) fn claim_all(
         }
         return (Vec::new(), refused);
     }
+    output::arguments(format_args!(
+        "GPU PCI configuration extent qualification v15\n"
+    ));
+    output::arguments(format_args!("GPU interrupt handoff diagnostics v16\n"));
+    output::arguments(format_args!("GPU display and durable progress v17\n"));
+    output::arguments(format_args!("GPU firmware DMA page allocation v18\n"));
     let mut claimed = Vec::new();
     let mut refused = Vec::new();
     let source = match gop {
@@ -1322,7 +1348,9 @@ pub(super) fn claim_all(
         Err(why) => {
             for adapter in nvidia {
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
-                refused.push(refused_as(adapter, Reason::Other));
+                let mut refusal = refused_as(adapter, Reason::Other);
+                refusal.detail = Some(why.clone());
+                refused.push(refusal);
             }
             return (claimed, refused);
         }
@@ -1343,11 +1371,14 @@ pub(super) fn claim_all(
             Ok(function) => claimed.push(function),
             Err(error) => {
                 output::arguments(format_args!("GPU {} refused: {error:?}\n", adapter.address));
+                let detail = format!("{error:?}");
                 let reason = match error {
                     ServiceError::Refused(NO_FIRMWARE) => Reason::MissingFirmware,
                     _ => Reason::Other,
                 };
-                refused.push(refused_as(adapter, reason));
+                let mut refusal = refused_as(adapter, reason);
+                refusal.detail = Some(detail);
+                refused.push(refusal);
             }
         }
     }
@@ -1558,13 +1589,21 @@ pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
 }
 
 /// Takes the display for the GPUs [`open`] bound, in the firmware's `screen`
-/// size if it can, and opens their Metal services.
+/// size if it can, and opens their Metal services. `firmware` names the PCI
+/// function that showed the firmware's picture, `None` when there was a
+/// picture whose function is unknown.
 pub(super) fn serve(
-    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: (usize, usize),
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: Option<(usize, usize)>,
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] firmware: Option<&str>,
 ) {
     #[cfg(feature = "nvk")]
     {
-        display::take(screen);
+        let shown = match (screen, firmware) {
+            (None, _) => display::Shown::Nothing,
+            (Some(_), None) => display::Shown::Unknown,
+            (Some(_), Some(function)) => display::Shown::By(function),
+        };
+        display::take(screen.unwrap_or((0, 0)), shown);
         gate::open_service();
     }
 }
@@ -1781,6 +1820,7 @@ fn mount_and_start(
         threads,
         time,
         deadline,
+        "Linux's first tasks",
         || matches!(srcu.status(), stela_linux::srcu::Status::Pending(status) if status.joined),
     )?;
     // SAFETY: the taskless dispatcher observed the original joined job.
@@ -1797,7 +1837,9 @@ fn mount_and_start(
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
-    wait_for_child(runtime, threads, time, deadline, || pending.status().joined)?;
+    wait_for_child(runtime, threads, time, deadline, "the GPU's probe", || {
+        pending.status().joined
+    })?;
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
         unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
@@ -1813,23 +1855,52 @@ fn mount_and_start(
     Ok((owner, threads, job))
 }
 
+/// Wait for `stage` of the start, which Linux's tasks run, until `finished`
+/// or `deadline` on `time`. A long wait says every
+/// [`WAIT_REPORT_SECONDS`] how long it has waited by the counter and by
+/// Linux's clock, and how many service steps it took, and stores the USB's
+/// log: a start that never returns then shows whether this loop still
+/// runs, whether Linux's clock moves, and which stage it waits for. The
+/// counter ends the wait after [`START_SECONDS`] even when the clock
+/// stands still.
 fn wait_for_child(
     runtime: Pin<&stela_drivers::platform::work::Runtime<SLOTS>>,
     threads: &LinuxThreads,
     time: &dyn Clock,
     deadline: u64,
+    stage: &str,
     finished: impl Fn() -> bool,
 ) -> Result<(), Error> {
+    let began = host::rdtsc();
+    let began_ns = time.now_ns().map_err(environment_error)?;
+    let mut steps = 0u64;
+    let mut reports = 0u64;
     loop {
         // SAFETY: runtime is on its dispatcher after real physical return.
         unsafe { threads.dispatcher_step() }.map_err(Error::Threads)?;
         if finished() {
             return Ok(());
         }
-        if time.now_ns().map_err(environment_error)? >= deadline {
+        let now = time.now_ns().map_err(environment_error)?;
+        let waited_ms = output::millis_since(began);
+        // The counter bounds the wait too, when Linux's clock stands still.
+        if now >= deadline || waited_ms >= START_SECONDS * 1000 {
             return Err(Error::Timeout);
         }
+        if waited_ms / 1000 / WAIT_REPORT_SECONDS > reports {
+            reports = waited_ms / 1000 / WAIT_REPORT_SECONDS;
+            output::arguments(format_args!(
+                "GPU START waiting for {stage}: {waited_ms} ms by the counter, {} ms by \
+                 Linux's clock, {steps} steps\n",
+                now.saturating_sub(began_ns) / 1_000_000,
+            ));
+            crate::status::progress(&format!(
+                "{stage}: waiting {waited_ms} ms, {steps} service steps"
+            ));
+            super::storage::store_usb_log_in_gpu_start();
+        }
         runtime.step_or_idle().map_err(environment_error)?;
+        steps += 1;
     }
 }
 

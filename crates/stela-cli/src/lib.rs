@@ -240,6 +240,7 @@ mod tests {
         for words in [
             &["status"][..],
             &["repair", "--ipsw", "a.ipsw", "--erase-target"],
+            &["repair", "--ipsw", "a.ipsw", "--installer", "offline"],
             &["update", "stela", "--efi", "stela.efi"],
             &["update", "os", "--ipsw", "a.ipsw"],
             &["update", "stela", "--fetch"],

@@ -1077,6 +1077,9 @@ fn run_machine<H: Host>(
         host_acpi,
         mut boot_progress,
     } = io;
+    if restore.is_some() {
+        display::install_console();
+    }
     crate::status::begin(match restore {
         Some(_) => "Starting the macOS installer",
         None => "Starting macOS",
@@ -1377,6 +1380,11 @@ pub(crate) fn inside_host_drivers() -> bool {
 /// the USB's log itself between two devices.
 pub(crate) fn starting_host_devices() -> bool {
     storage::starting_devices_here()
+}
+
+/// Persist the USB log at a safe boundary inside GPU startup.
+pub(crate) fn store_usb_log_in_gpu_start() -> bool {
+    storage::store_usb_log_in_gpu_start()
 }
 
 /// Unload the GPUs' firmware before a fatal stop, where one can

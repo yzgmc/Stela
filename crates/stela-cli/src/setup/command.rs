@@ -442,6 +442,9 @@ impl Create {
 
 #[derive(Args)]
 struct Repair {
+    /// Switch the existing USB to an offline or online installer without formatting it.
+    #[arg(long, value_enum, value_name = "KIND")]
+    installer: Option<super::InstallImage>,
     #[command(flatten)]
     usb: Found,
     #[command(flatten)]
@@ -480,6 +483,7 @@ struct Repair {
 impl Repair {
     fn request(self) -> Request {
         let mut request = Request {
+            install_image: self.installer,
             erase_target: self.erase_target,
             initialize_nor: self.initialize_nor,
             ecid: self.ecid,

@@ -55,7 +55,12 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 let (record, data) = payload.split::<BeginRender>()?;
                 let request = self.render_pass(connection, &record, data.bytes())?;
                 if let Err(error) = self.device.begin_render(commands, &request) {
-                    self.noted = Some(self.describe_pass(&request));
+                    // Pending compilation is retried by SharedService. It is
+                    // not a rejected pass and must not flood the boot log.
+                    if error != crate::metal::compiler::DEFERRED {
+                        self.noted =
+                            Some(format!("{} reason={error:?}", self.describe_pass(&request)));
+                    }
                     return Err(error.into());
                 }
             }
@@ -525,7 +530,16 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 },
             )
         };
-        let mut text = String::from("PASS REFUSED");
+        let mut text = format!(
+            "PASS REFUSED v20 target={}x{} layers={} samples={} tile={:?} sample_positions={} rate_map={}",
+            request.render_target_width,
+            request.render_target_height,
+            request.render_target_array_length,
+            request.default_raster_sample_count,
+            request.tile_memory,
+            request.sample_positions.len(),
+            request.rasterization_rate_map
+        );
         for (index, attachment) in request.color_attachments.iter().enumerate() {
             let Some(attachment) = attachment else {
                 continue;

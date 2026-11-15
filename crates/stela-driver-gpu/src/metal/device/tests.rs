@@ -2984,6 +2984,78 @@ fn framebuffer_reads_of_a_linear_attachment_run_on_its_copy() {
     assert_eq!((order.as_str(), pairs.len()), ("be", 0));
 }
 
+/// Boot 25's WindowServer passes must preserve their memoryless scratch targets.
+#[test]
+fn window_server_boot_pass_formats_begin_and_submit() {
+    for (format, height, extra, load) in [
+        (PixelFormat::Bgra8Unorm, 60, false, LoadAction::Load),
+        (PixelFormat::Rgb10A8_2pXr10, 1440, true, LoadAction::Clear),
+        (PixelFormat::Rgb10A8_2pXr10, 1440, false, LoadAction::Clear),
+    ] {
+        let mut device = device();
+        let mut colors = [None; MAX_COLOR_ATTACHMENTS];
+        for (index, pixel_format) in [format, PixelFormat::Rgba16Float, PixelFormat::R32Float]
+            .into_iter()
+            .take(if extra { 3 } else { 2 })
+            .enumerate()
+        {
+            let mut descriptor = texture(
+                pixel_format,
+                TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ,
+            );
+            descriptor.width = 2560;
+            descriptor.height = height;
+            descriptor.options = options(if index == 0 {
+                StorageMode::Managed
+            } else {
+                StorageMode::Memoryless
+            });
+            let texture = device.new_texture(&descriptor).unwrap();
+            colors[index] = Some(AttachmentRequest {
+                texture,
+                level: 0,
+                slice: 0,
+                depth_plane: 0,
+                resolve: None,
+                load_action: if index == 0 {
+                    load
+                } else {
+                    LoadAction::DontCare
+                },
+                store_action: if index == 0 {
+                    StoreAction::Store
+                } else {
+                    StoreAction::DontCare
+                },
+                store_action_options: StoreActionOptions::EMPTY,
+                clear: [0.0; 4],
+                surface: None,
+            });
+        }
+        let request = RenderPassRequest {
+            color_attachments: colors,
+            depth_attachment: None,
+            depth_resolve_filter: MultisampleDepthResolveFilter::Sample0,
+            stencil_attachment: None,
+            stencil_resolve_filter: MultisampleStencilResolveFilter::Sample0,
+            visibility_result_buffer: None,
+            visibility_result_type: VisibilityResultType::Reset,
+            render_target_array_length: 0,
+            render_target_width: 0,
+            render_target_height: 0,
+            default_raster_sample_count: 0,
+            tile_memory: Default::default(),
+            sample_positions: Vec::new(),
+            rasterization_rate_map: false,
+            counter_samples: Vec::new(),
+        };
+        let mut commands = device.new_command_buffer();
+        device.begin_render(&mut commands, &request).unwrap();
+        commands.end_encoding(&mut device.resolver()).unwrap();
+        device.commit(commands).unwrap();
+    }
+}
+
 #[test]
 fn render_passes_resolve_cached_attachment_views() {
     let mut device = device();

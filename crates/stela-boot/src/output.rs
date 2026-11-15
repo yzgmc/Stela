@@ -781,6 +781,9 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
     // The interrupted driver call holds the disks' lock and may be partway
     // through a request of its own.
     if crate::engine::inside_host_drivers() {
+        if wait && crate::engine::store_usb_log_in_gpu_start() {
+            return;
+        }
         static SAID: AtomicBool = AtomicBool::new(false);
         // The device start stores the USB's log itself between devices.
         if !crate::engine::starting_host_devices() && !SAID.swap(true, Ordering::Relaxed) {
@@ -977,6 +980,11 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();
+    // A GPU reset may have removed the only screen. Keep the stop reason
+    // before trying to unload its firmware or draw a fatal message.
+    if crate::engine::inside_host_drivers() {
+        flush_log();
+    }
     crate::engine::stop_gpus_for_fatal();
     // The reason is on the screen before the last store, which may be what
     // fails, and the advice after it says whether the log was kept.

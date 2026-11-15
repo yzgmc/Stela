@@ -388,6 +388,19 @@ impl<R: CapabilityRead> Capabilities<R> {
             0x09 => {
                 let bytes = self.read.read(offset + 2, 1)? as u16 & 0xff;
                 if bytes < 3 {
+                    // Alder Lake-S xHCI (8086:7ae0) exposes a terminal vendor
+                    // entry at 0xb0 with length zero (upstream issue #26).
+                    // No caller here interprets this opaque vendor body. Keep
+                    // its header/length cell reserved, without inventing a body
+                    // size or relaxing checks for any other capability/device.
+                    if bytes == 0
+                        && offset == 0xb0
+                        && self.read16(offset)? == 0x0009
+                        && self.read.read(regs::VENDOR_ID, 4)? == 0x7ae0_8086
+                        && self.read.read(regs::CLASS_REVISION, 4)? >> 8 == 0x0c03_30
+                    {
+                        return Ok((3, Layout::Unsupported));
+                    }
                     return Err(CapabilityError::Malformed { offset }.into());
                 }
                 sized(bytes)

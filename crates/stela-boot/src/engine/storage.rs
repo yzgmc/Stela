@@ -228,6 +228,45 @@ fn between_drivers<T>(between: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Whether the USB's log is the one the device start resumed ([`HeldLog`]),
+/// which the holder of the host drivers' lock drives itself.
+static HELD_USB_LOG: AtomicBool = AtomicBool::new(false);
+
+/// The GS base of the processor in the GPU's start, zero while none is
+/// ([`in_gpu_start`]).
+static GPU_START_GS: AtomicU64 = AtomicU64::new(0);
+
+/// Run `start`, the GPU's start, as one where the USB's log may be stored
+/// ([`store_usb_log_in_gpu_start`]): it holds the host drivers' lock for
+/// Linux's whole start and calls no storage driver.
+pub(super) fn in_gpu_start<T>(start: impl FnOnce() -> T) -> T {
+    GPU_START_GS.store(this_gs(), Ordering::Release);
+    let result = start();
+    GPU_START_GS.store(0, Ordering::Release);
+    result
+}
+
+/// Store the USB's log from the GPU's start ([`in_gpu_start`]), which holds
+/// the host drivers' lock outside every storage driver's call: from a long
+/// wait, so a start that never returns leaves its lines on the stick, and
+/// from a stop there, a fault, panic or Linux BUG, whose screen the GPU's
+/// reset may have left dead. Only the log the device start resumed is
+/// driven by the lock's holder; any other would wait for the lock, and its
+/// lines wait for the next store after the start. A store already running
+/// here, as one a stop interrupted, is not entered again. Whether it was
+/// tried.
+pub(super) fn store_usb_log_in_gpu_start() -> bool {
+    let gs = this_gs();
+    let storable = HELD_USB_LOG.load(Ordering::Acquire)
+        && host_drivers_held_here()
+        && GPU_START_GS.load(Ordering::Acquire) == gs
+        && BETWEEN_GS.load(Ordering::Acquire) == 0;
+    if storable {
+        between_drivers(output::store_usb_log);
+    }
+    storable
+}
+
 /// Counter ticks cores waited for [`HOST_DRIVERS`] since the last report,
 /// and the longest wait.
 static HOST_DRIVERS_WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -876,6 +915,7 @@ impl stela_drivers::probe::Observer for Observer {
             failures: 0,
         });
         self.resumed = between_drivers(|| crate::log_file::resume_quietly(Box::new(log)));
+        HELD_USB_LOG.store(self.resumed, Ordering::Release);
     }
     fn starting(
         &mut self,
@@ -1497,6 +1537,29 @@ pub unsafe fn open(
     // transfer timeout's cancel, then reads its context instead of faulting.
     // SAFETY: the caller owns the handoff's DMA pages and controllers; the
     // loader refused a DMA range its physmap does not cover (`system::memory`).
+    // Qualify the exact legacy arena, as native owned DMA allocations do.
+    // Reading PAT/MTRRs/page tables allocates no DMA and changes no policy.
+    let dma_bytes = usize::try_from(handoff.dma.end - handoff.dma.start)
+        .map_err(|_| refuse!("host DMA reservation size is not representable"))?;
+    if dma_bytes != 0 {
+        let mapping = unsafe {
+            crate::native_memory::qualify_reserved_writeback(
+                crate::layout::physical(handoff.dma.start),
+                handoff.dma.start,
+                dma_bytes,
+            )
+        };
+        output::arguments(format_args!(
+            "HOST DMA v12 physical={:#x}..{:#x} cpu={:#x} WB={mapping:?}\n",
+            handoff.dma.start,
+            handoff.dma.end,
+            crate::layout::physical(handoff.dma.start)
+        ));
+        // Diagnostic only: this decoder qualifies WB, not every coherent
+        // cache policy a legacy arena can legitimately use. A refusal is
+        // evidence to inspect, not proof that DMA is unusable. Keep USB/log
+        // startup available so a failed check is actually recorded.
+    }
     let mut dma = unsafe {
         RegionAllocator::with_cpu_offset(handoff.dma.clone(), crate::layout::physical(0))
     };

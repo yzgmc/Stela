@@ -995,14 +995,17 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         crate::status::done("");
     }
     let restore = source.map(|source| {
-        prepare_restore(
+        crate::status::begin("Preparing macOS restore (file progress v14)");
+        let restore = prepare_restore(
             boot,
             source,
             restore_usb.unwrap(),
             tree,
             &host_network,
             fdr_device.take(),
-        )
+        );
+        crate::status::done("");
+        restore
     });
     // All source/resource preparation precedes the first publication.
     // A reached write failure is terminal before any guest entry.
@@ -1337,7 +1340,11 @@ fn open_gpus(
     let tsc_hz = handoff.tsc_hz;
     #[cfg(feature = "nvk")]
     let heap_bytes = heap.end - heap.start;
+    crate::status::info(
+        "GPU handoff v17: the display may lose signal during reset; stages are saved on the USB",
+    );
     crate::status::begin("Starting the GPU");
+    output::flush_log();
     let gop = if handoff.screen.is_some() {
         mmio.verified_framebuffer().map(Some)
     } else {
@@ -1354,10 +1361,12 @@ fn open_gpus(
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(&services, &adapters, gop, firmware.as_ref())
+            storage::in_gpu_start(|| gpu::claim_all(&services, &adapters, gop, firmware.as_ref()))
         });
         (claimed, refused, random)
     });
+    // Also preserve a rejected or timed-out claim, before any early return.
+    output::flush_log();
     let (claimed, random) = match claimed {
         Ok((claimed, _, Some(random))) if !claimed.is_empty() => (claimed, random),
         Ok((_, refused, _)) => {
@@ -1371,12 +1380,21 @@ fn open_gpus(
                         first.device,
                         first.reason,
                     ));
+                    if let Some(detail) = &first.detail {
+                        crate::status::info(&alloc::format!("GPU v16 {}: {detail}", first.address));
+                    }
                     for gpu in rest {
                         crate::status::info(&gpu_status::refused(
                             &gpu.address,
                             gpu.device,
                             gpu.reason,
                         ));
+                        if let Some(detail) = &gpu.detail {
+                            crate::status::info(&alloc::format!(
+                                "GPU v16 {}: {detail}",
+                                gpu.address
+                            ));
+                        }
                     }
                 }
             }
@@ -1410,7 +1428,8 @@ fn open_gpus(
     // even when the start never returns.
     output::flush_log();
     let opening = host::rdtsc();
-    let opened = gpu::open(machine, claimed);
+    // A stop inside the start stores the USB's log from there.
+    let opened = storage::in_gpu_start(|| gpu::open(machine, claimed));
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
     // functions, starting Linux, and nouveau's probe, which boots the GSP
     // and binds DRM.
@@ -1423,6 +1442,7 @@ fn open_gpus(
         ms(probe),
         ms(host::rdtsc().wrapping_sub(claiming)),
     ));
+    output::flush_log();
     match opened {
         Ok(()) => {
             crate::status::done("started");
@@ -1515,14 +1535,21 @@ fn place_devices(
             })
     };
     // The firmware's scanout keeps its newest frame itself; a GPU's is
-    // wrapped to keep one for `--scanout-mirror`.
+    // wrapped to keep one for `--scanout-mirror`. With neither a GPU's
+    // display nor the firmware's screen, which a bound GPU's reset ended, the
+    // guest keeps that screen's mode and a GPU's display found later shows it.
+    #[cfg(feature = "nvk")]
+    let mirrored = |scanout: alloc::boxed::Box<dyn stela_soc::machine::Scanout>| match options
+        .scanout_mirror
+    {
+        true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
+        false => scanout,
+    };
     #[cfg(feature = "nvk")]
     let scanout = gpu::display::scanout()
-        .map(|scanout| match options.scanout_mirror {
-            true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
-            false => scanout,
-        })
-        .or_else(firmware_scanout);
+        .map(mirrored)
+        .or_else(firmware_scanout)
+        .or_else(|| gpu::display::awaited(handoff.screen?).map(mirrored));
     #[cfg(not(feature = "nvk"))]
     let scanout = firmware_scanout();
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
@@ -2166,8 +2193,24 @@ fn prepare_restore(
         },
     )
     .unwrap_or_else(|error| {
-        output::arguments(format_args!("restore preparation refusal: {error}\n"));
-        output::fatal("restore preparation failed")
+        // The native USB log may be unavailable after ExitBootServices.
+        // Keep the actual refusal and adapter state on the failure screen.
+        let diagnostic = host_network
+            .as_ref()
+            .and_then(|network| network.as_ref().ok())
+            .and_then(|network| {
+                network
+                    .0
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut network| network.adapter_diagnostics())
+            });
+        match diagnostic {
+            Some(diagnostic) => output::fatal(format_args!(
+                "restore preparation failed: {error}\n{diagnostic}"
+            )),
+            None => output::fatal(format_args!("restore preparation failed: {error}")),
+        }
     })
 }
 
@@ -2877,7 +2920,14 @@ fn start_devices(
                 && let Ok(work) = work
                 && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
             {
-                gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+                let firmware = handoff
+                    .screen
+                    .and_then(|screen| screen.pci_source)
+                    .map(|source| format!("{}", source.address));
+                gpu::serve(
+                    handoff.screen.map(|screen| screen.resolution()),
+                    firmware.as_deref(),
+                );
             }
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {

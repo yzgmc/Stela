@@ -346,3 +346,51 @@ fn extended_refuses_loops_overlaps_and_null_entries() {
         Err(CapabilityError::OutOfRange { offset: 0xff8 })
     );
 }
+
+#[test]
+fn alder_lake_xhci_zero_length_vendor_tail_keeps_usb_capabilities() {
+    let mut space = Space::new();
+    space.put32(0, 0x7ae0_8086);
+    space.put32(regs::CLASS_REVISION, 0x0c03_3011);
+    space.0[0x34] = 0x70;
+    space.standard(0x70, 1, 0x80);
+    space.put16(0x72, 3);
+    space.standard(0x80, 5, 0x90);
+    space.put16(0x82, 0x86); // Disabled, 64-bit, eight MSI messages.
+    space.standard(0x90, 9, 0xb0);
+    space.0[0x92] = 0x14;
+    space.standard(0xb0, 9, 0);
+    assert_eq!(
+        space.walk(),
+        [
+            Ok((0x70, 1, 8)),
+            Ok((0x80, 5, 14)),
+            Ok((0x90, 9, 20)),
+            Ok((0xb0, 9, 3))
+        ]
+    );
+    assert_eq!(stopped_in_d0(&space), Ok(true));
+    assert_eq!(
+        capabilities(&space).last().unwrap().unwrap().layout,
+        Layout::Unsupported
+    );
+
+    // The exception is not permission to accept other malformed bodies or devices.
+    for (identity, class, header, length) in [
+        (0x7ae0_1234, 0x0c03_3011, 9, 0),
+        (0x1234_8086, 0x0c03_3011, 9, 0),
+        (0x7ae0_8086, 0x0200_0011, 9, 0),
+        (0x7ae0_8086, 0x0c03_3011, 0xb009, 0),
+        (0x7ae0_8086, 0x0c03_3011, 9, 1),
+        (0x7ae0_8086, 0x0c03_3011, 9, 2),
+    ] {
+        space.put32(0, identity);
+        space.put32(regs::CLASS_REVISION, class);
+        space.put16(0xb0, header);
+        space.0[0xb2] = length;
+        assert_eq!(
+            space.walk().last(),
+            Some(&Err(CapabilityError::Malformed { offset: 0xb0 }))
+        );
+    }
+}
