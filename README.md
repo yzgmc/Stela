@@ -1,3 +1,19 @@
+> ## 这是 H610I 非官方修改版（v21）
+>
+> 本分支 `h610i-v21` 基于上游 `25f661c`，包含 2026-11-13 ~ 11-14 针对
+> JGINYUE H610I-GAMING / i5-12400F / RTX 4060 测试机所做的 76 个源码改动，
+> 逐文件对应已写入 U 盘的 v21 引导。**与上游作者无关**，也不是上游的升级版本
+> （上游已发布 v0.4.1，本分支没有整体跟进，请勿与上游最新 main 混用）。
+>
+> - 改动清单、逐版记录与许可声明：[H610I-CHANGES.md](H610I-CHANGES.md)
+> - 上游原始说明保留在下方分隔线之后。
+> - 上游代码见 [`main`](https://github.com/yzgmc/Stela/tree/main) 分支。
+>
+> EFI 为 GPL-2.0-only、CLI 为 GPL-3.0-or-later；`LICENSE`、`NOTICE`、
+> `LICENSES/` 及第三方许可材料原样保留。
+
+---
+
 <h1 align="center">
   <img src="assets/stela-icon.png" alt="" width="96"><br>
   Stela
